@@ -1,0 +1,21 @@
+The ``app.py`` module contains several functions and a class with
+incorrect behavior:
+
+1. ``calculate_total(prices: Iterable[float]) -> float``: This function
+   should return the sum of all numbers in the ``prices`` iterable.
+   It currently returns only the first element.  Fix it so that it
+   correctly sums all values and returns the total.  If ``prices`` is
+   empty, return ``0.0``.
+
+2. ``multiply(a: int, b: int) -> int``: This function currently
+   returns the sum of ``a`` and ``b``, but it should return their
+   product.  Correct the implementation to perform multiplication.
+
+3. The ``Counter`` class:
+   - The ``increment`` method should increase the counter’s ``value``
+     attribute by 1.  It currently decrements the value.
+   - The ``reset`` method should set ``value`` back to zero.  It
+     currently sets ``value`` to 1.  Fix these methods accordingly.
+
+Ensure that no other part of the module is altered beyond correcting
+these behaviors, and preserve the existing docstrings and type hints.

@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Groq Code Fixer</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+      color: #333;
+      min-height: 100vh;
+    }
+    .header-img {
+      width: 100%;
+      height: 200px;
+      object-fit: cover;
+    }
+    .container {
+      max-width: 900px;
+      margin: -80px auto 2rem auto;
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+      padding: 2rem;
+    }
+    h1 {
+      margin-top: 0;
+      color: #6c5ce7;
+    }
+    textarea {
+      width: 100%;
+      min-height: 200px;
+      font-family: monospace;
+      margin-bottom: 1rem;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 0.5rem;
+    }
+    button {
+      background-color: #6c5ce7;
+      color: #fff;
+      padding: 0.6rem 1.5rem;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 1rem;
+    }
+    button:hover {
+      background-color: #5946c6;
+    }
+    pre {
+      background: #fafafa;
+      padding: 1rem;
+      overflow-x: auto;
+      border-left: 4px solid #6c5ce7;
+    }
+
+    /* Mode selection buttons styling */
+    .mode-buttons {
+      display: flex;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+    .mode-buttons .mode-btn {
+      flex: 1;
+      background-color: #6c5ce7;
+      color: #fff;
+      padding: 0.6rem 1rem;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 1rem;
+      transition: background-color 0.2s ease;
+    }
+    .mode-buttons .mode-btn:hover {
+      background-color: #5946c6;
+    }
+    .error {
+      color: #e74c3c;
+      margin-bottom: 1rem;
+    }
+  </style>
+</head>
+<body>
+  <!-- Decorative header image -->
+  <img src="{{ url_for('static', filename='header.png') }}" alt="Decorative header" class="header-img">
+  <div class="container">
+    <h1>Groq Code Fixer</h1>
+    <p>Choose a mode below to either fix/refactor individual code snippets or an entire directory of files.</p>
+    {% if error %}
+      <div class="error">{{ error }}</div>
+    {% endif %}
+    <!-- Mode selection buttons -->
+    <div class="mode-buttons">
+      <button type="button" id="btn-snippet" class="mode-btn" data-mode="snippet">
+        Refactor / Correct
+      </button>
+      <button type="button" id="btn-folder" class="mode-btn" data-mode="folder">
+        Refactor Folder
+      </button>
+      <button type="button" id="btn-summarize" class="mode-btn" data-mode="summarize">
+        Summarize with Comments
+      </button>
+      <button type="button" id="btn-convert" class="mode-btn" data-mode="convert">
+        Convert to Python
+      </button>
+    </div>
+    <!-- Hidden select retained for server-side mode tracking -->
+    <select id="mode" name="mode" style="display: none;">
+      <option value="snippet" {% if mode == 'snippet' or not mode %}selected{% endif %}>Refactor / Correct</option>
+      <option value="folder" {% if mode == 'folder' %}selected{% endif %}>Refactor Folder</option>
+      <option value="summarize" {% if mode == 'summarize' %}selected{% endif %}>Summarize with Comments</option>
+    </select>
+    <hr style="margin: 1rem 0; border: none; border-top: 1px solid #eee;">
+    <!-- Snippet form -->
+    <div id="snippet-form" style="display: {% if mode == 'folder' %}none{% else %}block{% endif %};">
+      <form method="post" id="fix-form">
+        <input type="hidden" name="form_mode" value="snippet">
+        <label for="issue"><strong>Issue Description</strong>:</label><br>
+        <textarea id="issue" name="issue" placeholder="Describe how the code should behave...">{{ issue|e }}</textarea><br>
+        <hr style="margin: 1.5rem 0; border: none; border-top: 1px solid #eee;">
+        <div id="file-groups">
+          <!-- The first file input group -->
+          <div class="file-group">
+            <label><strong>File Name</strong>:</label><br>
+            <input type="text" name="file_name[]" placeholder="e.g. mymodule.py" value="{{ file_names[0] if file_names|length > 0 else '' }}" style="width: 100%; margin-bottom: 0.5rem;">
+            <label><strong>Code</strong>:</label><br>
+            <textarea name="code[]" placeholder="Paste your code here...">{{ codes[0] if codes|length > 0 else '' }}</textarea><br>
+          </div>
+          {% for idx in range(1, file_names|length) %}
+          <div class="file-group">
+            <label><strong>File Name</strong>:</label><br>
+            <input type="text" name="file_name[]" value="{{ file_names[idx] }}" style="width: 100%; margin-bottom: 0.5rem;">
+            <label><strong>Code</strong>:</label><br>
+            <textarea name="code[]">{{ codes[idx] }}</textarea><br>
+          </div>
+          {% endfor %}
+        </div>
+        <button type="button" id="add-file" style="margin-top: 1rem; background-color: #00b894;">Add another file</button>
+        <button type="submit" style="margin-left: 1rem;">Run</button>
+      </form>
+      {% if results %}
+        {% for result in results %}
+          <h2>{{ result.file_name }} &ndash; Corrected Code</h2>
+          <pre>{{ result.corrected }}</pre>
+          <h3>Unified Diff</h3>
+          <pre>{{ result.diff }}</pre>
+          <h3>Code Summary</h3>
+          <p>{{ result.code_summary }}</p>
+          <h3>Change Summary</h3>
+          <p>{{ result.summary }}</p>
+        {% endfor %}
+      {% endif %}
+    </div>
+    <!-- Folder form -->
+    <div id="folder-form" style="display: {% if mode == 'folder' %}block{% else %}none{% endif %};">
+      <form method="post" id="folder-run-form">
+        <input type="hidden" name="form_mode" value="folder">
+        <label for="folder_path"><strong>Folder Path</strong>:</label><br>
+        <input type="text" id="folder_path" name="folder_path" placeholder="/absolute/path/to/project" value="{{ folder_path or '' }}" style="width: 100%; margin-bottom: 1rem;"><br>
+        <label for="folder_issue"><strong>Issue Description</strong>:</label><br>
+        <textarea id="folder_issue" name="folder_issue" placeholder="Describe how the code should behave...">{{ folder_issue|e if folder_issue is defined }}</textarea><br>
+        <label for="languages"><strong>Languages</strong> (comma-separated extensions)</label><br>
+        <input type="text" id="languages" name="languages" value="{{ languages or 'py,java,js' }}" style="width: 100%; margin-bottom: 1rem;"><br>
+        <button type="submit">Run Folder Refactor</button>
+      </form>
+      {% if folder_results %}
+        {% for file_res in folder_results %}
+          <h2>{{ file_res.file_name }} &ndash; Corrected Code</h2>
+          <pre>{{ file_res.corrected }}</pre>
+          <h3>Unified Diff</h3>
+          <pre>{{ file_res.diff }}</pre>
+          <h3>Code Summary</h3>
+          <p>{{ file_res.code_summary }}</p>
+          <h3>Change Summary</h3>
+          <p>{{ file_res.summary }}</p>
+        {% endfor %}
+      {% endif %}
+    </div>
+
+    <!-- Summarize form -->
+    <div id="summarize-form" style="display: {% if mode == 'summarize' %}block{% else %}none{% endif %};">
+      <form method="post" id="summarize-run-form">
+        <input type="hidden" name="form_mode" value="summarize">
+        <hr style="margin: 1.5rem 0; border: none; border-top: 1px solid #eee;">
+        <div id="summarize-groups">
+          <div class="file-group">
+            <label><strong>File Name</strong>:</label><br>
+            <input type="text" name="sum_file_name[]" placeholder="e.g. mymodule.py" value="{{ sum_file_names[0] if sum_file_names|default([])|length > 0 else '' }}" style="width: 100%; margin-bottom: 0.5rem;">
+            <label><strong>Code</strong>:</label><br>
+            <textarea name="sum_code[]" placeholder="Paste your code here...">{{ sum_codes[0] if sum_codes|default([])|length > 0 else '' }}</textarea><br>
+          </div>
+          {% for idx in range(1, sum_file_names|default([])|length) %}
+          <div class="file-group">
+            <label><strong>File Name</strong>:</label><br>
+            <input type="text" name="sum_file_name[]" value="{{ sum_file_names[idx] }}" style="width: 100%; margin-bottom: 0.5rem;">
+            <label><strong>Code</strong>:</label><br>
+            <textarea name="sum_code[]">{{ sum_codes[idx] }}</textarea><br>
+          </div>
+          {% endfor %}
+        </div>
+        <button type="button" id="add-sum-file" style="margin-top: 1rem; background-color: #00b894;">Add another file</button>
+        <button type="submit" style="margin-left: 1rem;">Summarize</button>
+      </form>
+      {% if summarize_results %}
+        {% for sres in summarize_results %}
+          <h2>{{ sres.file_name }} &ndash; Commented Code</h2>
+          <pre>{{ sres.commented }}</pre>
+          <h3>Code Summary</h3>
+          <p>{{ sres.code_summary }}</p>
+        {% endfor %}
+      {% endif %}
+    </div>
+
+    <!-- Convert form -->
+    <div id="convert-form" style="display: {% if mode == 'convert' %}block{% else %}none{% endif %};">
+      <form method="post" id="convert-run-form">
+        <input type="hidden" name="form_mode" value="convert">
+        <hr style="margin: 1.5rem 0; border: none; border-top: 1px solid #eee;">
+        <div id="convert-groups">
+          <div class="file-group">
+            <label><strong>File Name</strong>:</label><br>
+            <input type="text" name="conv_file_name[]" placeholder="e.g. Example.java or Example.py" value="{{ conv_file_names[0] if conv_file_names|length > 0 else '' }}" style="width: 100%; margin-bottom: 0.5rem;">
+            <label><strong>Code</strong>:</label><br>
+            <textarea name="conv_code[]" placeholder="Paste your code here...">{{ conv_codes[0] if conv_codes|length > 0 else '' }}</textarea><br>
+          </div>
+          {% for idx in range(1, conv_file_names|length) %}
+          <div class="file-group">
+            <label><strong>File Name</strong>:</label><br>
+            <input type="text" name="conv_file_name[]" value="{{ conv_file_names[idx] }}" style="width: 100%; margin-bottom: 0.5rem;">
+            <label><strong>Code</strong>:</label><br>
+            <textarea name="conv_code[]">{{ conv_codes[idx] }}</textarea><br>
+          </div>
+          {% endfor %}
+        </div>
+        <button type="button" id="add-conv-file" style="margin-top: 1rem; background-color: #00b894;">Add another file</button>
+        <button type="submit" style="margin-left: 1rem;">Convert</button>
+      </form>
+      {% if convert_results %}
+        {% for cres in convert_results %}
+          <h2>{{ cres.file_name }} &ndash; Converted Code</h2>
+          <pre>{{ cres.converted }}</pre>
+        {% endfor %}
+      {% endif %}
+    </div>
+    <script>
+      // Switch between modes using hidden select and custom buttons
+      const modeSelect = document.getElementById('mode');
+      const snippetForm = document.getElementById('snippet-form');
+      const folderForm = document.getElementById('folder-form');
+      const summarizeForm = document.getElementById('summarize-form');
+      const convertForm = document.getElementById('convert-form');
+      function updateFormDisplay(value) {
+        if (value === 'folder') {
+          snippetForm.style.display = 'none';
+          folderForm.style.display = 'block';
+          summarizeForm.style.display = 'none';
+          convertForm.style.display = 'none';
+        } else if (value === 'summarize') {
+          snippetForm.style.display = 'none';
+          folderForm.style.display = 'none';
+          summarizeForm.style.display = 'block';
+          convertForm.style.display = 'none';
+        } else if (value === 'convert') {
+          snippetForm.style.display = 'none';
+          folderForm.style.display = 'none';
+          summarizeForm.style.display = 'none';
+          convertForm.style.display = 'block';
+        } else {
+          // default to snippet mode
+          snippetForm.style.display = 'block';
+          folderForm.style.display = 'none';
+          summarizeForm.style.display = 'none';
+          convertForm.style.display = 'none';
+        }
+      }
+      // Event listener on hidden select (in case of server-side update)
+      modeSelect.addEventListener('change', function() {
+        updateFormDisplay(this.value);
+      });
+      // Custom mode buttons
+      document.getElementById('btn-snippet').addEventListener('click', function() {
+        modeSelect.value = 'snippet';
+        updateFormDisplay('snippet');
+      });
+      document.getElementById('btn-folder').addEventListener('click', function() {
+        modeSelect.value = 'folder';
+        updateFormDisplay('folder');
+      });
+      document.getElementById('btn-summarize').addEventListener('click', function() {
+        modeSelect.value = 'summarize';
+        updateFormDisplay('summarize');
+      });
+      document.getElementById('btn-convert').addEventListener('click', function() {
+        modeSelect.value = 'convert';
+        updateFormDisplay('convert');
+      });
+      // Dynamic addition of file groups for snippet mode
+      document.getElementById('add-file').addEventListener('click', function() {
+        const fileGroups = document.getElementById('file-groups');
+        const newGroup = document.createElement('div');
+        newGroup.className = 'file-group';
+        newGroup.innerHTML = `
+          <label><strong>File Name</strong>:</label><br>
+          <input type="text" name="file_name[]" placeholder="e.g. another.py" style="width: 100%; margin-bottom: 0.5rem;">
+          <label><strong>Code</strong>:</label><br>
+          <textarea name="code[]" placeholder="Paste your code here..."></textarea><br>
+        `;
+        fileGroups.appendChild(newGroup);
+      });
+
+      // Dynamic addition of file groups for summarize mode
+      document.getElementById('add-sum-file').addEventListener('click', function() {
+        const sumGroups = document.getElementById('summarize-groups');
+        const newGroup = document.createElement('div');
+        newGroup.className = 'file-group';
+        newGroup.innerHTML = `
+          <label><strong>File Name</strong>:</label><br>
+          <input type="text" name="sum_file_name[]" placeholder="e.g. another.py" style="width: 100%; margin-bottom: 0.5rem;">
+          <label><strong>Code</strong>:</label><br>
+          <textarea name="sum_code[]" placeholder="Paste your code here..."></textarea><br>
+        `;
+        sumGroups.appendChild(newGroup);
+      });
+
+      // Dynamic addition of file groups for convert mode
+      document.getElementById('add-conv-file').addEventListener('click', function() {
+        const convGroups = document.getElementById('convert-groups');
+        const newGroup = document.createElement('div');
+        newGroup.className = 'file-group';
+        newGroup.innerHTML = `
+          <label><strong>File Name</strong>:</label><br>
+          <input type="text" name="conv_file_name[]" placeholder="e.g. another.java or another.py" style="width: 100%; margin-bottom: 0.5rem;">
+          <label><strong>Code</strong>:</label><br>
+          <textarea name="conv_code[]" placeholder="Paste your code here..."></textarea><br>
+        `;
+        convGroups.appendChild(newGroup);
+      });
+    </script>
+  </div>
+</body>
+</html>
