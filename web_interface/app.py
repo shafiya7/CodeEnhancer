@@ -1,251 +1,438 @@
-"""Simple Flask-based web interface for Groq code fixes.
-
-This application provides a form where users can paste Python code and
-an issue description.  Upon submission, it calls Groq’s Llama 3.1 8 B
-model to produce corrected code and displays both the full corrected
-code and a unified diff showing the changes.  It relies on the
-utilities defined in ``groq_fix_utils.py`` located in the project root
-for prompt construction and diff generation.
-
-Requirements:
-
-    pip install flask groq
-
-Ensure that the environment variable ``GROQ_API_KEY`` is set before
-running this server.  To start the app, run ``python app.py`` and
-visit ``http://localhost:5000`` in your browser.
-"""
-
 from __future__ import annotations
 
 import os
 import sys
 from pathlib import Path
+
 from flask import Flask, render_template, request
-from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(PROJECT_ROOT))
 
 from groq_fix_utils import (
-    build_prompt,
     call_groq,
     generate_patch,
-    build_refactor_prompt,
     build_summary_prompt,
     build_code_summary_prompt,
     build_comment_code_prompt,
     build_conversion_prompt,
-    detect_language,
 )
+
 from multi_language_refactor_cli import find_supported_files
 
-# Initialize Flask app
 app = Flask(__name__)
+
+
+def strip_markdown_fences(code: str) -> str:
+    """
+    Remove markdown code fences like ```python ... ```
+    returned by LLM responses.
+    """
+    code = code.strip()
+
+    if code.startswith("```"):
+        lines = code.splitlines()
+
+        # Remove first markdown fence
+        lines = lines[1:]
+
+        # Remove ending markdown fence
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+
+        code = "\n".join(lines)
+
+    return code.strip()
+
+
+def build_refactor_prompt(issue: str, file_content: str, file_name: str) -> str:
+    return f"""
+You are a senior software engineer.
+
+USER REQUEST:
+{issue}
+
+TASK:
+Rewrite/refactor this file based on the user request.
+
+IMPORTANT RULES:
+- Return ONLY raw source code
+- Do NOT include markdown
+- Do NOT wrap code in ```python
+- Do NOT add explanations
+- Preserve functionality unless explicitly requested otherwise
+
+FILE NAME:
+{file_name}
+
+CURRENT CODE:
+{file_content}
+"""
+
+
+def build_file_relevance_prompt(
+    user_query: str,
+    file_name: str,
+    file_content: str,
+) -> str:
+    return f"""
+You are deciding whether a source file needs modification.
+
+USER REQUEST:
+{user_query}
+
+FILE NAME:
+{file_name}
+
+FILE CONTENT:
+{file_content[:4000]}
+
+Answer ONLY:
+YES
+or
+NO
+"""
+
+
+def should_modify_file(
+    user_query: str,
+    file_name: str,
+    file_content: str,
+) -> bool:
+    prompt = build_file_relevance_prompt(
+        user_query,
+        file_name,
+        file_content,
+    )
+
+    answer = call_groq(
+        prompt,
+        model="llama-3.1-8b-instant",
+        temperature=0.0,
+    )
+
+    answer = strip_markdown_fences(answer)
+
+    return answer.strip().upper().startswith("YES")
+
+
+def apply_rewritten_code(
+    file_path: Path,
+    original_code: str,
+    rewritten_code: str,
+) -> Path:
+    backup_path = file_path.with_suffix(file_path.suffix + ".bak")
+
+    backup_path.write_text(original_code)
+
+    file_path.write_text(rewritten_code)
+
+    return backup_path
 
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    """Render the main page and process form submissions for one or multiple files."""
-    mode = None
-    # Values for snippet form
-    codes: list[str] = []
-    file_names: list[str] = []
-    results: list[dict[str, str]] | None = None
-    issue = ""
-    # Values for folder form
-    folder_path = None
-    folder_issue = None
-    languages = None
-    folder_results: list[dict[str, str]] | None = None
-    # Values for summarize form
-    # Initialize as empty lists; using None in templates can cause length errors
-    sum_file_names: list[str] | None = None
-    sum_codes: list[str] | None = None
-    # Values for conversion form
-    conv_file_names: list[str] | None = None
-    conv_codes: list[str] | None = None
-    convert_results: list[dict[str, str]] | None = None
-    summarize_results: list[dict[str, str]] | None = None
+    mode = "snippet"
+
+    results = None
+    folder_results = None
+    summarize_results = None
+    convert_results = None
+
     error = None
+
     if request.method == "POST":
-        mode = request.form.get("form_mode")
+        mode = request.form.get("form_mode", "snippet")
+
+        # =========================
+        # SNIPPET MODE
+        # =========================
         if mode == "snippet":
             issue = request.form.get("issue", "").strip()
-            codes = request.form.getlist("code[]")
-            file_names = request.form.getlist("file_name[]")
-            # Clean up empty pairs
-            paired = [(fn.strip(), cd) for fn, cd in zip(file_names, codes) if fn.strip() or cd.strip()]
-            file_names = [p[0] for p in paired]
-            codes = [p[1] for p in paired]
-            if not issue:
-                error = "Please provide an issue description."
-            elif not codes:
-                error = "Please provide at least one file with code."
+            code = request.form.get("code", "").strip()
+            file_name = request.form.get("file_name", "input.py").strip()
+
+            if not issue or not code:
+                error = "Issue and code are required."
             else:
-                results = []
                 try:
-                    for fn, cd in zip(file_names, codes):
-                        # Determine language based on file extension and build a refactor prompt
-                        file_name = fn if fn else "input"
-                        prompt = build_refactor_prompt(issue, cd, file_name)
-                        corrected_code = call_groq(
-                            prompt, model="llama-3.1-8b-instant", temperature=0.0
-                        )
-                        diff = generate_patch(
-                            cd,
-                            corrected_code,
-                            fromfile=file_name,
-                            tofile=f"{file_name} (patched)",
-                        )
-                        # Summarize the changes and original code functionality
-                        summary_prompt = build_summary_prompt(cd, corrected_code, file_name)
-                        summary_text = call_groq(summary_prompt, model="llama-3.1-8b-instant", temperature=0.0)
-                        code_summary_prompt = build_code_summary_prompt(cd, file_name)
-                        code_summary = call_groq(code_summary_prompt, model="llama-3.1-8b-instant", temperature=0.0)
-                        results.append(
-                            {
-                                "file_name": file_name,
-                                "corrected": corrected_code,
-                                "diff": diff,
-                                "summary": summary_text,
-                                "code_summary": code_summary,
-                            }
-                        )
-                except SystemExit as exc:
+                    prompt = build_refactor_prompt(
+                        issue,
+                        code,
+                        file_name,
+                    )
+
+                    corrected_code = call_groq(
+                        prompt,
+                        model="llama-3.1-8b-instant",
+                        temperature=0.0,
+                    )
+
+                    corrected_code = strip_markdown_fences(corrected_code)
+
+                    diff = generate_patch(
+                        code,
+                        corrected_code,
+                        fromfile=file_name,
+                        tofile=f"{file_name} (rewritten)",
+                    )
+
+                    results = [
+                        {
+                            "file_name": file_name,
+                            "corrected": corrected_code,
+                            "diff": diff,
+                        }
+                    ]
+
+                except Exception as exc:
                     error = str(exc)
+
+        # =========================
+        # FOLDER MODE
+        # =========================
         elif mode == "folder":
-            # Process folder refactor
             folder_path = request.form.get("folder_path", "").strip()
             folder_issue = request.form.get("folder_issue", "").strip()
-            languages = request.form.get("languages", "py,java,js").strip()
+            languages = request.form.get("languages", "py").strip()
+
+            apply_changes = request.form.get("apply_changes") == "yes"
+
+            selective_update = (
+                request.form.get("selective_update") == "yes"
+            )
+
             if not folder_path or not folder_issue:
-                error = "Please provide both folder path and an issue description."
+                error = "Folder path and issue are required."
+
             else:
-                folder_results = []
-                lang_set = {ext.strip().lower() for ext in languages.split(",") if ext.strip()}
                 try:
                     base = Path(folder_path)
+
                     if not base.exists():
-                        raise SystemExit(f"Folder {folder_path} does not exist")
+                        raise Exception("Folder does not exist")
+
+                    lang_set = {
+                        ext.strip().lower()
+                        for ext in languages.split(",")
+                        if ext.strip()
+                    }
+
                     files = list(find_supported_files(base, lang_set))
-                    if not files:
-                        raise SystemExit("No supported files found in the specified folder")
+
+                    folder_results = []
+
+                    # Relevance check only for large folders
+                    USE_RELEVANCE_CHECK = len(files) > 5
+
                     for fpath in files:
                         rel = fpath.relative_to(base)
+
                         original_code = fpath.read_text()
-                        prompt = build_refactor_prompt(folder_issue, original_code, str(rel))
-                        corrected = call_groq(prompt, model="llama-3.1-8b-instant", temperature=0.0)
+
+                        # =========================
+                        # Selective Update
+                        # =========================
+                        if selective_update and USE_RELEVANCE_CHECK:
+                            relevant = should_modify_file(
+                                folder_issue,
+                                str(rel),
+                                original_code,
+                            )
+
+                            if not relevant:
+                                folder_results.append(
+                                    {
+                                        "file_name": str(rel),
+                                        "status": "skipped",
+                                        "summary": "Skipped because file is not relevant.",
+                                        "backup": "",
+                                        "corrected": "",
+                                        "diff": "",
+                                    }
+                                )
+
+                                continue
+
+                        # =========================
+                        # Rewrite file
+                        # =========================
+                        prompt = build_refactor_prompt(
+                            folder_issue,
+                            original_code,
+                            str(rel),
+                        )
+
+                        rewritten_code = call_groq(
+                            prompt,
+                            model="llama-3.1-8b-instant",
+                            temperature=0.0,
+                        )
+
+                        rewritten_code = strip_markdown_fences(
+                            rewritten_code
+                        )
+
+                        # =========================
+                        # Validate Python syntax
+                        # =========================
+                        if str(rel).endswith(".py"):
+                            try:
+                                compile(
+                                    rewritten_code,
+                                    str(rel),
+                                    "exec",
+                                )
+                            except SyntaxError as e:
+                                folder_results.append(
+                                    {
+                                        "file_name": str(rel),
+                                        "status": "syntax_error",
+                                        "summary": str(e),
+                                        "backup": "",
+                                        "corrected": rewritten_code,
+                                        "diff": "",
+                                    }
+                                )
+                                continue
+
                         diff = generate_patch(
                             original_code,
-                            corrected,
+                            rewritten_code,
                             fromfile=str(rel),
-                            tofile=f"{rel} (refactored)",
+                            tofile=f"{rel} (rewritten)",
                         )
-                        # Summaries
-                        summary_prompt = build_summary_prompt(original_code, corrected, str(rel))
-                        summary_text = call_groq(summary_prompt, model="llama-3.1-8b-instant", temperature=0.0)
-                        code_summary_prompt = build_code_summary_prompt(original_code, str(rel))
-                        code_summary = call_groq(code_summary_prompt, model="llama-3.1-8b-instant", temperature=0.0)
-                        folder_results.append({
-                            "file_name": str(rel),
-                            "corrected": corrected,
-                            "diff": diff,
-                            "summary": summary_text,
-                            "code_summary": code_summary,
-                        })
-                except SystemExit as exc:
-                    error = str(exc)
-        elif mode == "summarize":
-            # Summarize code with comments
-            sum_file_names = request.form.getlist("sum_file_name[]")
-            sum_codes = request.form.getlist("sum_code[]")
-            # Clean up empty pairs
-            pairs = [(fn.strip(), cd) for fn, cd in zip(sum_file_names, sum_codes) if fn.strip() or cd.strip()]
-            sum_file_names = [p[0] for p in pairs]
-            sum_codes = [p[1] for p in pairs]
-            if not sum_codes:
-                error = "Please provide at least one file with code to summarize."
-            else:
-                summarize_results = []
-                try:
-                    for fn, cd in zip(sum_file_names, sum_codes):
-                        file_name = fn if fn else "input"
-                        # Code summary
-                        code_summary_prompt = build_code_summary_prompt(cd, file_name)
-                        code_summary = call_groq(code_summary_prompt, model="llama-3.1-8b-instant", temperature=0.0)
-                        # Commented code
-                        comment_prompt = build_comment_code_prompt(cd, file_name)
-                        commented_code = call_groq(comment_prompt, model="llama-3.1-8b-instant", temperature=0.0)
-                        summarize_results.append({
-                            "file_name": file_name,
-                            "code_summary": code_summary,
-                            "commented": commented_code,
-                        })
-                except SystemExit as exc:
-                    error = str(exc)
-        elif mode == "convert":
-            # Convert code between Python and Java based on file extension
-            conv_file_names = request.form.getlist("conv_file_name[]")
-            conv_codes = request.form.getlist("conv_code[]")
-            # Clean up empty pairs
-            pairs = [(fn.strip(), cd) for fn, cd in zip(conv_file_names, conv_codes) if fn.strip() or cd.strip()]
-            conv_file_names = [p[0] for p in pairs]
-            conv_codes = [p[1] for p in pairs]
-            if not conv_codes:
-                error = "Please provide at least one file with code to convert."
-            else:
-                convert_results = []
-                try:
-                    for fn, cd in zip(conv_file_names, conv_codes):
-                        file_name = fn if fn else "input"
-                        conv_prompt = build_conversion_prompt(cd, file_name)
-                        converted = call_groq(conv_prompt, model="llama-3.1-8b-instant", temperature=0.0)
-                        convert_results.append(
+
+                        status = "preview"
+                        backup_path = ""
+
+                        # =========================
+                        # Apply changes
+                        # =========================
+                        if apply_changes:
+                            backup = apply_rewritten_code(
+                                fpath,
+                                original_code,
+                                rewritten_code,
+                            )
+
+                            backup_path = str(backup)
+
+                            status = "updated"
+
+                        folder_results.append(
                             {
-                                "file_name": file_name,
-                                "converted": converted,
+                                "file_name": str(rel),
+                                "status": status,
+                                "summary": f"Processed using instruction: {folder_issue}",
+                                "backup": backup_path,
+                                "corrected": rewritten_code,
+                                "diff": diff,
                             }
                         )
-                except SystemExit as exc:
+
+                except Exception as exc:
                     error = str(exc)
-    else:
-        # initialize default values
-        codes = [""]
-        file_names = [""]
-        mode = "snippet"
-        # Initialise summarisation lists to avoid None handling in template
-        sum_file_names = [""]
-        sum_codes = [""]
-        # Conversion form defaults
-        conv_file_names = [""]
-        conv_codes = [""]
+
+        # =========================
+        # SUMMARIZE MODE
+        # =========================
+        elif mode == "summarize":
+            code = request.form.get("sum_code", "").strip()
+            file_name = request.form.get(
+                "sum_file_name",
+                "input.py",
+            ).strip()
+
+            try:
+                code_summary_prompt = build_code_summary_prompt(
+                    code,
+                    file_name,
+                )
+
+                code_summary = call_groq(
+                    code_summary_prompt,
+                    model="llama-3.1-8b-instant",
+                    temperature=0.0,
+                )
+
+                comment_prompt = build_comment_code_prompt(
+                    code,
+                    file_name,
+                )
+
+                commented_code = call_groq(
+                    comment_prompt,
+                    model="llama-3.1-8b-instant",
+                    temperature=0.0,
+                )
+
+                commented_code = strip_markdown_fences(
+                    commented_code
+                )
+
+                summarize_results = [
+                    {
+                        "file_name": file_name,
+                        "code_summary": code_summary,
+                        "commented": commented_code,
+                    }
+                ]
+
+            except Exception as exc:
+                error = str(exc)
+
+        # =========================
+        # CONVERT MODE
+        # =========================
+        elif mode == "convert":
+            code = request.form.get("conv_code", "").strip()
+            file_name = request.form.get(
+                "conv_file_name",
+                "Example.java",
+            ).strip()
+
+            try:
+                conv_prompt = build_conversion_prompt(
+                    code,
+                    file_name,
+                )
+
+                converted = call_groq(
+                    conv_prompt,
+                    model="llama-3.1-8b-instant",
+                    temperature=0.0,
+                )
+
+                converted = strip_markdown_fences(converted)
+
+                convert_results = [
+                    {
+                        "file_name": file_name,
+                        "converted": converted,
+                    }
+                ]
+
+            except Exception as exc:
+                error = str(exc)
+
     return render_template(
         "index.html",
         mode=mode,
-        issue=issue,
-        codes=codes,
-        file_names=file_names,
         results=results,
-        folder_path=folder_path,
-        folder_issue=folder_issue,
         folder_results=folder_results,
-        languages=languages,
-        # Ensure lists are passed to the template; default to empty lists if None
-        sum_file_names=sum_file_names or [""],
-        sum_codes=sum_codes or [""],
         summarize_results=summarize_results,
-        conv_file_names=conv_file_names or [""],
-        conv_codes=conv_codes or [""],
         convert_results=convert_results,
         error=error,
     )
 
 
-if __name__ == "__main__":  
+if __name__ == "__main__":
     api_key = os.getenv("GROQ_API_KEY")
+
     if not api_key:
         raise SystemExit(
-            "Environment variable GROQ_API_KEY must be set before running the server."
+            "GROQ_API_KEY environment variable must be set."
         )
+
     app.run(debug=True, host="0.0.0.0", port=5000)
